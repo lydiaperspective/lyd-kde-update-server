@@ -7,7 +7,7 @@ from flask import Flask, request, redirect, url_for, session, render_template_st
 DB = os.getenv('STATE_DB', '/state/manager.db')
 app = Flask(__name__)
 app.secret_key = os.environ.get('SESSION_SECRET') or secrets.token_hex(32)
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict', SESSION_COOKIE_SECURE=True, PERMANENT_SESSION_LIFETIME=3600)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict', SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true", PERMANENT_SESSION_LIFETIME=3600)
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
