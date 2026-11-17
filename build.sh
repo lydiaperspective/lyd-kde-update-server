@@ -1,0 +1,305 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+# SPDX-FileCopyrightText: 2023 Harald Sitter <sitter@kde.org>
+# SPDX-FileCopyrightText: 2024 Bruno Pajdek <brupaj@proton.me>
+# SPDX-FileCopyrightText: 2026 Hadi Chokr <hadichokr@icloud.com>
+
+# Build image using mkosi, well, somewhat. mkosi is actually a bit too inflexible for our purposes so we generate a OS
+# tree using mkosi and then construct shipable .iso9660 (and gpt raw disk images) for installation and tarballs (for systemd-sysupdate)
+# ourselves.
+
+set -ex
+
+BUILD_ISO="${BUILD_ISO:-1}"
+
+cleanup_build() {
+    local status=$?
+    # Do not leave the ESP loop mount behind when a build is cancelled or fails.
+    if [ -d kde-linux.cache/esp.raw.mnt ] && mountpoint -q kde-linux.cache/esp.raw.mnt; then
+        umount kde-linux.cache/esp.raw.mnt || umount -l kde-linux.cache/esp.raw.mnt || true
+    fi
+    if [ "$status" -ne 0 ]; then
+        rm -rf kde-linux.cache/esp.raw.mnt kde-linux.cache/esp.raw kde-linux.cache/live.raw kde-linux.cache/root.raw
+        rm -rf live-root
+        if [ -n "${OUTPUT:-}" ]; then rm -rf "${OUTPUT}" "${OUTPUT}".*; fi
+    fi
+    exit "$status"
+}
+trap cleanup_build EXIT
+
+. .kde-linux-metadata
+
+# Install the git pre-commit hook. CI runs the linters separately.
+if [ -z "${CI:-}" ] && [ -d .git/hooks ] && [ ! -e .git/hooks/pre-commit ] && [ ! -L .git/hooks/pre-commit ]; then
+  ln --symbolic --relative .gitlab-ci/scripts/pre-commit-tool .git/hooks/pre-commit
+fi
+
+# Creates a sysext containing the KDE debug symbols, downloaded from the packages pipeline.
+make_debug_archive () {
+  # Create an empty directory at /var/tmp/debugroot to extract the debug symbols into before compressing.
+  rm --recursive --force /var/tmp/debugroot
+  mkdir --parents /var/tmp/debugroot
+
+  # Download and extract debug symbols produced by the packages pipeline.
+  curl --fail "https://kde-linux-packages.s3.kde.org/$KDE_LINUX_EDITION/artifacts/debug.tar.zst" \
+    | zstd --decompress | tar --extract --directory=/var/tmp/debugroot
+
+  # systemd-sysext uses the os-release in extension-release.d to verify the sysext matches the base OS,
+  # and can therefore be safely installed. Copy the base OS' os-release there.
+  mkdir --parents /var/tmp/debugroot/usr/lib/extension-release.d/
+  cp "${OUTPUT}/usr/lib/os-release" /var/tmp/debugroot/usr/lib/extension-release.d/extension-release.debug
+
+  # Compress /var/tmp/debugroot/usr into a zstd tarball at $DEBUG_TAR.
+  # We only need usr because that's where all the relevant stuff lives.
+  tar --directory=/var/tmp/debugroot --create --file="$DEBUG_TAR" usr
+  zstd --threads=0 --rm "$DEBUG_TAR" # --threads=0 automatically uses the optimal number
+  rm --recursive --force /var/tmp/debugroot
+}
+
+EPOCH=$(date --utc +%s) # The epoch (only used to then construct the various date strings)
+VERSION=$(date --utc --date="@$EPOCH" +%Y%m%d%H%M)
+OUTPUT="mkosi.output/kde-linux_$VERSION"   # Built rootfs path (mkosi uses this directory by default)
+
+# Canonicalize the path in $OUTPUT to avoid any possible path issues.
+OUTPUT="$(readlink --canonicalize-missing "$OUTPUT")"
+
+MAIN_UKI=${OUTPUT}.efi               # Output main UKI path
+LIVE_UKI=${OUTPUT}_live.efi          # Output live UKI path
+DEBUG_TAR=${OUTPUT}_debug-x86-64.tar # Output debug archive path (.zst will be added)
+# SUPER WARNING: Do not use the more common foo.erofs.caibx suffix. It breaks stuff!
+# https://github.com/systemd/systemd/issues/38605
+# We'll rename things accordingly via sysupdate.d files.
+ROOTFS_CAIBX=${OUTPUT}_root-x86-64.caibx
+ROOTFS_EROFS=${OUTPUT}_root-x86-64.erofs # Output erofs image path
+ISO="${OUTPUT}.iso" # both a valid GPT disk image and a bootable ISO
+
+EFI_BASE=kde-linux_${VERSION} # Base name of the UKI in the image's ESP
+EFI=${EFI_BASE}+3.efi      # Name of primary UKI in the image's ESP (with tries counter for installed system)
+LIVE_EFI=${EFI_BASE}.efi   # Name of live UKI in the ESP (no tries counter — ESP is read-only on ISO)
+
+# Clean up old build artifacts.
+rm --recursive --force kde-linux.cache/*.raw kde-linux.cache/*.iso kde-linux.cache/*.mnt
+
+# Start with the KDE Linux pacman configuration.
+cp /etc/pacman.conf.nolinux mkosi.sandbox/etc/pacman.conf
+
+# Enable multilib and CachyOS.
+cat >> mkosi.sandbox/etc/pacman.conf <<'EOF'
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+
+[cachyos]
+SigLevel = Never
+Include = /etc/pacman.d/cachyos-mirrorlist
+EOF
+
+# Create the pacman mirror directory.
+
+mkdir --parents mkosi.sandbox/etc/pacman.d
+# Ensure the base image does not go out of sync with the Arch snapshot used to build packages.
+# WARNING: code copy in bootstrap.sh
+BUILD_REPO=$(curl --fail --silent "https://kde-linux-packages.s3.kde.org/$KDE_LINUX_EDITION/repo/build_repo.txt")
+if [ -z "$BUILD_REPO" ]; then
+  echo "ERROR: Could not fetch build_repo.txt — refusing to build out-of-sync image." >&2
+  exit 1
+fi
+
+# Create the KDE-pinned Arch mirrorlist.
+echo "Server = ${BUILD_REPO}/\$repo/os/\$arch" \
+  > mkosi.sandbox/etc/pacman.d/mirrorlist
+
+# Copy the CachyOS mirrorlist installed by bootstrap.sh.
+cp /etc/pacman.d/cachyos-mirrorlist \
+   mkosi.sandbox/etc/pacman.d/cachyos-mirrorlist
+
+# ... and make sure our cache is up to date. Second --refresh forces a refresh.
+pacman --sync --refresh --refresh --noconfirm
+
+# Make sure permissions are sound
+./permission-fix.sh
+
+cargo build --release --manifest-path btrfs-migrator/Cargo.toml
+cp -v btrfs-migrator/target/release/btrfs-migrator mkosi.extra/usr/lib/
+
+# Unprivileged sudo(1) CLI that rewrites its arguments into a run0 invocation.
+# Tarball of commit 9fa985d == tag 1.4.2; digest checked against a git fetch of that commit.
+RUN0_SUDO_SHIM_COMMIT=9fa985ddb9dc7f4d66aa7bfc3bc3188e4aa1d727
+RUN0_SUDO_SHIM_SHA256=efd4eac1ba02777f22f228f6d733a287e14bbef7fd2b9a4818b2afadca719ea1
+rm --recursive --force run0-sudo-shim run0-sudo-shim.tar.gz
+curl -fsSL --output run0-sudo-shim.tar.gz \
+    "https://github.com/lordgrimmauld/run0-sudo-shim/archive/$RUN0_SUDO_SHIM_COMMIT.tar.gz"
+echo "$RUN0_SUDO_SHIM_SHA256  run0-sudo-shim.tar.gz" | sha256sum --check --strict -
+mkdir run0-sudo-shim
+tar --extract --gzip --strip-components=1 --directory run0-sudo-shim --file run0-sudo-shim.tar.gz
+cargo build --release --locked --manifest-path run0-sudo-shim/Cargo.toml
+install -Dm755 run0-sudo-shim/target/release/run0-sudo-shim mkosi.extra/usr/bin/run0-sudo-shim
+
+rm --recursive --force kde-linux-sysupdated
+git clone https://invent.kde.org/kde-linux/kde-linux-sysupdated
+sh patches/apply-sysupdated-patch.sh kde-linux-sysupdated
+DESTDIR=$PWD/mkosi.extra make --directory=kde-linux-sysupdated install
+
+cargo install --root "$PWD/mkosi.extra/usr/" --git https://invent.kde.org/kde-linux/etc-mstack \
+    etc-mstack \
+    etc-mstack-prepare
+
+# Extract the KDE packages pipeline output into mkosi.extra so kde-builder built files
+# are baked directly into the image instead of going through the package repo.
+curl --fail "https://kde-linux-packages.s3.kde.org/$KDE_LINUX_EDITION/artifacts/install.tar.zst" \
+    -o install.tar.zst
+
+# Generate a mkosi dropin with the packages from the packages pipeline
+curl --fail "https://kde-linux-packages.s3.kde.org/$KDE_LINUX_EDITION/artifacts/packages.txt" \
+    -o packages.txt
+
+mkdir -p mkosi.conf.d
+{
+    echo "[Content]"
+    while IFS= read -r pkg; do
+        echo "Packages=$pkg"
+    done < packages.txt
+} > mkosi.conf.d/40-kde-packages.conf
+
+mkosi \
+    --environment="CI_COMMIT_SHORT_SHA=${CI_COMMIT_SHORT_SHA:-unknownSHA}" \
+    --environment="CI_COMMIT_SHA=${CI_COMMIT_SHA:-unknownSHA}" \
+    --environment="CI_PIPELINE_URL=${CI_PIPELINE_URL:-https://invent.kde.org}" \
+    --environment="KDE_LINUX_EDITION=$KDE_LINUX_EDITION" \
+    --image-version="$VERSION" \
+    --extra-tree="$PWD/install.tar.zst" --extra-tree="$PWD/mkosi.extra" \
+    "$@"
+
+# NOTE: /efi must be empty so auto mounting can happen. As such we put our templates in a different directory
+rm -rfv "${OUTPUT}/efi"
+[ -d "${OUTPUT}/efi" ] || mkdir --mode 0700 "${OUTPUT}/efi"
+[ -d "${OUTPUT}/usr/share/factory/boot" ] || mkdir --mode 0700 "${OUTPUT}/usr/share/factory/boot"
+[ -d "${OUTPUT}/usr/share/factory/boot/EFI" ] || mkdir --mode 0700 "${OUTPUT}/usr/share/factory/boot/EFI"
+[ -d "${OUTPUT}/usr/share/factory/boot/EFI/Linux" ] || mkdir --mode 0700 "${OUTPUT}/usr/share/factory/boot/EFI/Linux"
+[ -d "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$EFI_BASE.efi.extra.d" ] || mkdir --mode 0700 "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$EFI_BASE.efi.extra.d"
+
+# Save the main UKI (with tries counter) aside as it must NOT go into factory/boot yet
+# so it doesn't end up on the live ESP.
+cp -v "${OUTPUT}"/kde-linux.efi "$MAIN_UKI"
+rm -v "${OUTPUT}"/kde-linux.efi
+mv -v "${OUTPUT}"/erofs.addon.efi "${OUTPUT}_erofs.addon.efi"
+mv -v "${OUTPUT}"/live.efi "$LIVE_UKI"
+
+make_debug_archive
+
+if [ "$BUILD_ISO" = "1" ]; then
+# Now let's actually build the live ESP.
+# We use kde-linux.cache instead of /tmp as usual because we'll probably run out of space there.
+
+# Only LIVE_EFI (no tries counter) goes into factory/boot for the ESP.
+# The installed system UKI ($EFI with +3) is added AFTER the ESP is built.
+mv "$LIVE_UKI" "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$LIVE_EFI"
+
+# Change to kde-linux.cache since we'll be working there.
+cd kde-linux.cache
+
+# Create a 280M large FAT32 filesystem inside of esp.raw.
+fallocate -l 280M esp.raw
+mkfs.fat -F 32 esp.raw
+
+# Mount it to esp.raw.mnt.
+mkdir -p esp.raw.mnt
+mount esp.raw esp.raw.mnt
+
+# Copy everything from /usr/share/factory/boot into esp.raw.mnt.
+# At this point only LIVE_EFI is in factory/boot/EFI/Linux/ so the installed UKI (+3) is not there yet.
+cp --archive --recursive "${OUTPUT}/usr/share/factory/boot/." esp.raw.mnt
+
+# We're done, unmount esp.raw.mnt.
+umount esp.raw.mnt
+
+cd .. # and back to root
+
+else
+    echo "==> BUILD_ISO=0: skipping live ESP creation."
+    rm -f "$LIVE_UKI"
+fi
+
+# Now add the installed system UKI (with tries counter) to factory/boot for the erofs rootfs.
+# This happens AFTER the ESP build so it doesn't land on the live ESP.
+cp "$MAIN_UKI" "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$EFI"
+
+# Remove the live UKI from factory as it was only needed for the ESP build.
+# The erofs rootfs should only contain the installed system UKI (+3).
+rm -f "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$LIVE_EFI"
+
+# Drop flatpak data from erofs. They are in the usr/share/factory and deployed from there.
+rm -rf "$OUTPUT/var/lib/flatpak"
+mkdir "$OUTPUT/var/lib/flatpak" # but keep a mountpoint around for the live session
+
+if [ "$BUILD_ISO" = "1" ]; then
+# Split /live out of the rootfs into its own erofs image. It becomes an extra
+# partition on the ISO (mkosi.repart/20-live.conf) and is mounted as a sysext by
+# run-extensions-live.mount, so installed systems never carry it.
+rm --recursive --force live-root
+mv "$OUTPUT/live" live-root
+time mkfs.erofs -zzstd -C 65536 --chunksize 65536 \
+    kde-linux.cache/live.raw live-root > erofs-live.log 2>&1
+else
+    # /live exists only for the bootable live environment; do not bake it into installed rootfs.
+    rm --recursive --force "$OUTPUT/live"
+fi
+
+time mkfs.erofs -zzstd -C 65536 --chunksize 65536 "-T$EPOCH" --ignore-mtime \
+    "$ROOTFS_EROFS" "$OUTPUT" > erofs.log 2>&1
+if [ "$BUILD_ISO" = "1" ]; then
+    cp --reflink=auto "$ROOTFS_EROFS" kde-linux.cache/root.raw
+fi
+
+if [ "$BUILD_ISO" = "1" ]; then
+# Now assemble the image using systemd-repart and the definitions in mkosi.repart into $ISO.
+# The resulting file is both a valid GPT disk image and a bootable El Torito ISO.
+touch "$ISO"
+systemd-repart \
+    --no-pager \
+    --empty=allow \
+    --size=auto \
+    --dry-run=no \
+    --root=kde-linux.cache \
+    --definitions=mkosi.repart \
+    --el-torito=true \
+    --el-torito-volume="KDE LINUX $VERSION" \
+    --el-torito-publisher="KDE" \
+    "$ISO"
+
+# Pad to whole 2048-byte sectors, VirtualBox rejects the ISO otherwise.
+# sfdisk moves the backup GPT back to the end of the image.
+iso_size=$(stat --format=%s "$ISO")
+if [ $((iso_size % 2048)) -ne 0 ]; then
+    truncate --size=$(( (iso_size + 2047) / 2048 * 2048 )) "$ISO"
+    sfdisk --relocate gpt-bak-std "$ISO"
+fi
+
+else
+    echo "==> BUILD_ISO=0: skipping bootable ISO assembly."
+fi
+
+# In case the owner is root
+chown -R lydia:lydia mkosi.output
+
+# Create a torrent for the image
+if [ "$BUILD_ISO" = "1" ]; then
+    ./torrent-create.rb "$VERSION" "$OUTPUT" "$ISO"
+fi
+
+go install -v github.com/folbricht/desync/cmd/desync@latest
+~/go/bin/desync make --print-stats --chunk-size 1024:2048:4096 "$ROOTFS_CAIBX" "$ROOTFS_EROFS"
+# Be very careful with this file. It is here for backwards compat. It must not appear in SHA256SUMS.
+# https://github.com/systemd/systemd/issues/38605
+cp "$ROOTFS_CAIBX" "$ROOTFS_EROFS.caibx"
+
+# Fake artifacts to keep older systems happy to upgrade to newer versions.
+# Can be removed once we have started having revisions in our update trees.
+tar -cf "${OUTPUT}"_root-x86-64.tar -T /dev/null
+zstd --threads=0 --rm "${OUTPUT}"_root-x86-64.tar
+
+# TODO before accepting new uploads perform sanity checks on the artifacts (e.g. the tar being well formed)
+
+# efi images and torrents are 700, make them readable so the server can serve them
+chmod go+r "$OUTPUT".* ./mkosi.output/*.efi ./mkosi.output/*.torrent
+ls -lah

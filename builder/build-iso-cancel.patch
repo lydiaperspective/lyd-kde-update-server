@@ -1,0 +1,99 @@
+--- a/build.sh
++++ b/build.sh
+@@ -10,6 +10,23 @@
+ 
+ set -ex
+ 
++BUILD_ISO="${BUILD_ISO:-1}"
++
++cleanup_build() {
++    local status=$?
++    # Do not leave the ESP loop mount behind when a build is cancelled or fails.
++    if [ -d kde-linux.cache/esp.raw.mnt ] && mountpoint -q kde-linux.cache/esp.raw.mnt; then
++        umount kde-linux.cache/esp.raw.mnt || umount -l kde-linux.cache/esp.raw.mnt || true
++    fi
++    if [ "$status" -ne 0 ]; then
++        rm -rf kde-linux.cache/esp.raw.mnt kde-linux.cache/esp.raw kde-linux.cache/live.raw kde-linux.cache/root.raw
++        rm -rf live-root
++        if [ -n "${OUTPUT:-}" ]; then rm -rf "${OUTPUT}" "${OUTPUT}".*; fi
++    fi
++    exit "$status"
++}
++trap cleanup_build EXIT
++
+ . .kde-linux-metadata
+ 
+ # Install the git pre-commit hook. CI runs the linters separately.
+@@ -170,6 +187,7 @@
+ 
+ make_debug_archive
+ 
++if [ "$BUILD_ISO" = "1" ]; then
+ # Now let's actually build the live ESP.
+ # We use kde-linux.cache instead of /tmp as usual because we'll probably run out of space there.
+ 
+@@ -197,18 +215,24 @@
+ 
+ cd .. # and back to root
+ 
++else
++    echo "==> BUILD_ISO=0: skipping live ESP creation."
++    rm -f "$LIVE_UKI"
++fi
++
+ # Now add the installed system UKI (with tries counter) to factory/boot for the erofs rootfs.
+ # This happens AFTER the ESP build so it doesn't land on the live ESP.
+ cp "$MAIN_UKI" "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$EFI"
+ 
+ # Remove the live UKI from factory as it was only needed for the ESP build.
+ # The erofs rootfs should only contain the installed system UKI (+3).
+-rm "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$LIVE_EFI"
++rm -f "${OUTPUT}/usr/share/factory/boot/EFI/Linux/$LIVE_EFI"
+ 
+ # Drop flatpak data from erofs. They are in the usr/share/factory and deployed from there.
+ rm -rf "$OUTPUT/var/lib/flatpak"
+ mkdir "$OUTPUT/var/lib/flatpak" # but keep a mountpoint around for the live session
+ 
++if [ "$BUILD_ISO" = "1" ]; then
+ # Split /live out of the rootfs into its own erofs image. It becomes an extra
+ # partition on the ISO (mkosi.repart/20-live.conf) and is mounted as a sysext by
+ # run-extensions-live.mount, so installed systems never carry it.
+@@ -216,11 +240,18 @@
+ mv "$OUTPUT/live" live-root
+ time mkfs.erofs -zzstd -C 65536 --chunksize 65536 \
+     kde-linux.cache/live.raw live-root > erofs-live.log 2>&1
++else
++    # /live exists only for the bootable live environment; do not bake it into installed rootfs.
++    rm --recursive --force "$OUTPUT/live"
++fi
+ 
+ time mkfs.erofs -zzstd -C 65536 --chunksize 65536 "-T$EPOCH" --ignore-mtime \
+     "$ROOTFS_EROFS" "$OUTPUT" > erofs.log 2>&1
+-cp --reflink=auto "$ROOTFS_EROFS" kde-linux.cache/root.raw
++if [ "$BUILD_ISO" = "1" ]; then
++    cp --reflink=auto "$ROOTFS_EROFS" kde-linux.cache/root.raw
++fi
+ 
++if [ "$BUILD_ISO" = "1" ]; then
+ # Now assemble the image using systemd-repart and the definitions in mkosi.repart into $ISO.
+ # The resulting file is both a valid GPT disk image and a bootable El Torito ISO.
+ touch "$ISO"
+@@ -244,11 +275,17 @@
+     sfdisk --relocate gpt-bak-std "$ISO"
+ fi
+ 
++else
++    echo "==> BUILD_ISO=0: skipping bootable ISO assembly."
++fi
++
+ # In case the owner is root
+ chown -R lydia:lydia mkosi.output
+ 
+ # Create a torrent for the image
+-./torrent-create.rb "$VERSION" "$OUTPUT" "$ISO"
++if [ "$BUILD_ISO" = "1" ]; then
++    ./torrent-create.rb "$VERSION" "$OUTPUT" "$ISO"
++fi
+ 
+ go install -v github.com/folbricht/desync/cmd/desync@latest
+ ~/go/bin/desync make --print-stats --chunk-size 1024:2048:4096 "$ROOTFS_CAIBX" "$ROOTFS_EROFS"
