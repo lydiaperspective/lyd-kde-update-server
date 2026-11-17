@@ -1,0 +1,70 @@
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kde-linux-builder
+    privileged: true
+    devices:
+      - /dev/loop-control:/dev/loop-control
+    volumes:
+      - /dev:/dev
+      - /sys:/sys:ro
+      - ./.env:/workspace/.env:ro
+      - build_sources:/workspace/sources
+      - build_source:/workspace/legacy-source:ro
+      - build_artifacts:/workspace/output
+      - build_state:/state
+      - build_gnupg:/gnupg
+      - ${GPG_EXPORT_DIR:-./key-export}:/key-export:rw
+    environment:
+      GITHUB_USERNAME: ${GITHUB_USERNAME}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      FORK_REPO: ${FORK_REPO}
+      UPSTREAM_REPO: ${UPSTREAM_REPO:-https://invent.kde.org/kde-linux/kde-linux.git}
+      TARGET_BRANCH: ${TARGET_BRANCH}
+      UPSTREAM_BRANCH: ${UPSTREAM_BRANCH:-master}
+      POLL_INTERVAL: ${POLL_INTERVAL:-604800}
+      GPG_KEY_NAME: ${GPG_KEY_NAME:-Custom KDE Linux}
+      GPG_KEY_EMAIL: ${GPG_KEY_EMAIL:-}
+      GPG_KEY_EXPIRE: ${GPG_KEY_EXPIRE:-0}
+      GPG_SIGNING_KEY: ${GPG_SIGNING_KEY:-}
+      GPG_PUBLIC_KEY_FILE: ${GPG_PUBLIC_KEY_FILE:-kde-linux-signing-public.asc}
+      DEFAULT_RETENTION: ${DEFAULT_RETENTION:-4}
+      DEFAULT_HISTORY_RETENTION: ${DEFAULT_HISTORY_RETENTION:-100}
+    restart: unless-stopped
+
+  manager:
+    build:
+      context: ./manager
+      dockerfile: Dockerfile
+    container_name: kde-linux-update-manager
+    ports:
+      - "127.0.0.1:5055:5055"
+    volumes:
+      - build_state:/state
+    environment:
+      STATE_DB: /state/manager.db
+      MANAGER_USERNAME: ${MANAGER_USERNAME:-admin}
+      MANAGER_PASSWORD: ${MANAGER_PASSWORD:?Set MANAGER_PASSWORD in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
+    depends_on:
+      - builder
+    restart: unless-stopped
+
+  webserver:
+    image: docker.io/library/caddy:alpine
+    container_name: kde-linux-webserver
+    ports:
+      - "8485:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - build_artifacts:/srv/artifacts:ro
+    restart: unless-stopped
+
+volumes:
+  build_sources:
+  build_source:
+  build_artifacts:
+  build_state:
+  build_gnupg:

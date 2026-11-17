@@ -5,8 +5,10 @@ This is an update-manager addition for the existing `lyd-kde-update-server` proj
 ## What is included
 
 - Dashboard with queued/running/completed/failed/cancelled builds, log view, and manual start/stop.
-- Multiple configured fork branches. Builds are serialized: only one build runs at a time.
-- Automatic build checks on the configured interval. The worker fetches and merges the fork and upstream branches; it skips the actual build when the resulting commit matches the last successfully published commit.
+- Multiple independent build jobs, one per fork branch. Each job has its own name, upstream branch, schedule interval, ISO setting, enabled/disabled state, and next-run time.
+- Scheduled builds are disabled by default. Enabling a job schedules its first run one full interval later; disabling it cancels a queued scheduled build but does not interrupt a build already running.
+- Manual “Run now” is available for disabled or enabled jobs. Jobs are serialized through one worker so privileged mkosi builds do not compete for loop devices, memory, or disk space.
+- The worker checks only enabled jobs when their individual next-run time is due. It fetches and merges the fork and upstream branches; it skips the actual build when the resulting commit matches the last successfully published commit.
 - Build history, commit SHA, previous successful SHA, and `git diff --name-status` file changes.
 - Settings for branches, upstream branch, build interval, update-feed retention, history retention, and bootable ISO creation.
 - GPG-signed `SHA256SUMS` and atomic replacement of each branch's `sysupdate/v2` feed, preserving the existing feed if the staged feed fails validation.
@@ -77,18 +79,20 @@ To stop sharing the manager through Tailscale:
 tailscale serve --https=443 off
 ```
 
-## First-time configuration
+## Configure multiple build jobs
 
-Sign in and open **Settings**:
+Sign in and open **Build jobs**. Add one job for each fork branch that you want to build, for example `main` and `lyd-kde-linux-server`. Each job has its own display name, fork branch, upstream branch, interval in hours, and ISO option. A branch can have only one job.
 
-- **Branches:** comma-separated names of branches that exist on your fork, for example `nvidia580xx-legacy,testing`.
-- **Upstream branch:** the KDE Linux branch to merge into each fork branch (for example `master`).
-- **Automatic build/check interval:** seconds between scheduled checks. Minimum is 60 seconds; the normal default is 604800 (one week). Each configured branch is checked in turn, one build at a time.
-- **Previous system updates to retain:** number of newest EFI versions retained in that branch's signed `sysupdate/v2` feed. Root EROFS/CAIBX artifacts matching expired versions are removed with their EFI version.
-- **Build history entries to retain:** independent history/log retention count.
-- **Also build bootable ISO:** when disabled, the build skips live ESP creation, live-root image creation, ISO assembly, and torrent creation. It still creates the normal system-update artifacts and signed feed.
+- New jobs are **disabled by default** and do not trigger a build when created.
+- Click **Enable** to schedule the first automatic build one full interval from that moment. The next-run time is shown in UTC.
+- Click **Disable** to prevent future scheduled builds and cancel a waiting scheduled build. A build already running is allowed to finish.
+- Click **Run now** to queue a manual build even when the schedule is disabled.
+- Delete a job to remove its schedule. Existing build history and published artifacts are retained. A job cannot be deleted while its build is running.
+- Schedules are independent, but the worker runs only one build at a time. If several jobs become due, they are processed in turn.
 
-A manual build can be started from the dashboard. Only one build can be queued/running at a time; this prevents two privileged mkosi builds from competing for loop devices, memory, and disk space.
+Open **Settings** for the default upstream branch used by new jobs, per-branch update-feed retention, and build-history retention. Existing jobs keep their own upstream branch and schedule. The ISO option is set per job: when disabled, the build skips live ESP creation, live-root image creation, ISO assembly, and torrent creation while still producing normal system-update artifacts and the signed feed.
+
+When upgrading an older manager database, its previously configured branches are imported as disabled jobs. This prevents the upgrade from unexpectedly starting scheduled builds.
 
 ## Output layout
 

@@ -9,6 +9,12 @@ def conn():
  c=sqlite3.connect(DB,timeout=30); c.row_factory=sqlite3.Row
  c.execute('PRAGMA busy_timeout=30000')
  try:
+  c.executescript('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS builds (id INTEGER PRIMARY KEY AUTOINCREMENT, branch TEXT NOT NULL, upstream_branch TEXT NOT NULL, build_iso INTEGER NOT NULL, status TEXT NOT NULL, queued_at TEXT NOT NULL, started_at REAL, finished_at REAL, commit_sha TEXT, previous_sha TEXT, log_path TEXT, error TEXT, cancel_requested INTEGER DEFAULT 0, changed_files TEXT DEFAULT '[]', job_id INTEGER, trigger TEXT NOT NULL DEFAULT 'manual');
+  CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, branch TEXT NOT NULL UNIQUE, upstream_branch TEXT NOT NULL DEFAULT 'master', interval_seconds INTEGER NOT NULL DEFAULT 86400, enabled INTEGER NOT NULL DEFAULT 0, build_iso INTEGER NOT NULL DEFAULT 1, next_run_at REAL, last_run_at REAL, created_at TEXT NOT NULL);''')
+  cols={r['name'] for r in c.execute('PRAGMA table_info(builds)').fetchall()}
+  if 'job_id' not in cols: c.execute('ALTER TABLE builds ADD COLUMN job_id INTEGER')
+  if 'trigger' not in cols: c.execute("ALTER TABLE builds ADD COLUMN trigger TEXT NOT NULL DEFAULT 'manual'")
   yield c
   c.commit()
  except Exception:
@@ -189,23 +195,27 @@ def main():
  except Exception as e: print('GPG initialization/export warning:',e,flush=True)
  while True:
   try:
+   # Migrate legacy comma-separated branch settings to disabled jobs. This is
+   # deliberately opt-in: old installations must not suddenly auto-build.
    with conn() as c:
     c.execute("INSERT INTO settings(key,value) VALUES('worker_status','Online') ON CONFLICT(key) DO UPDATE SET value='Online'")
+    migrated=c.execute("SELECT 1 FROM settings WHERE key='jobs_migrated'").fetchone()
+    if not migrated:
+     vals={r['key']:r['value'] for r in c.execute('SELECT key,value FROM settings')}
+     branches=[x.strip() for x in vals.get('branches',os.getenv('TARGET_BRANCH','main')).split(',') if x.strip()]
+     for branch in branches:
+      c.execute('INSERT OR IGNORE INTO jobs(name,branch,upstream_branch,interval_seconds,enabled,build_iso,next_run_at,created_at) VALUES(?,?,?,?,0,?,NULL,?)',(branch,branch,vals.get('upstream_branch',os.getenv('UPSTREAM_BRANCH','master')),max(3600,int(vals.get('poll_interval',os.getenv('POLL_INTERVAL','604800')))),int(vals.get('build_iso','1')=='1'),datetime.datetime.now(datetime.timezone.utc).isoformat()))
+     c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('jobs_migrated','1')")
     active=c.execute("SELECT id FROM builds WHERE status IN ('queued','running','cancelling') LIMIT 1").fetchone()
     if not active:
-     vals={r['key']:r['value'] for r in c.execute('SELECT key,value FROM settings')}
-     branches=[x.strip() for x in vals.get('branches',os.getenv('TARGET_BRANCH','master')).split(',') if x.strip()]
-     interval=max(60,int(vals.get('poll_interval',os.getenv('POLL_INTERVAL','604800'))))
-     last=0
-     for branch in branches:
-      key='auto_last_'+hashlib.sha256(branch.encode()).hexdigest()[:16]
-      try: last=float(vals.get(key,'0'))
-      except ValueError: last=0
-      if time.time()-last>=interval:
-       c.execute('INSERT INTO builds(branch,upstream_branch,build_iso,status,queued_at) VALUES(?,?,?,?,?)',(branch,vals.get('upstream_branch',os.getenv('UPSTREAM_BRANCH','master')),int(vals.get('build_iso','1')=='1'),'queued',datetime.datetime.now(datetime.timezone.utc).isoformat()))
-       c.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,str(time.time())))
-       print(f'Queued scheduled build for {branch}',flush=True)
-       break
+     due=c.execute('SELECT * FROM jobs WHERE enabled=1 AND next_run_at IS NOT NULL AND next_run_at<=? ORDER BY next_run_at,id LIMIT 1',(time.time(),)).fetchone()
+     if due:
+      queued=c.execute("SELECT id FROM builds WHERE job_id=? AND trigger='scheduled' AND status IN ('queued','running','cancelling')",(due['id'],)).fetchone()
+      if not queued:
+       c.execute('INSERT INTO builds(branch,upstream_branch,build_iso,status,queued_at,job_id,trigger) VALUES(?,?,?,?,?,?,?)',(due['branch'],due['upstream_branch'],due['build_iso'],'queued',datetime.datetime.now(datetime.timezone.utc).isoformat(),due['id'],'scheduled'))
+       next_run=time.time()+int(due['interval_seconds'])
+       c.execute('UPDATE jobs SET last_run_at=?,next_run_at=? WHERE id=?',(time.time(),next_run,due['id']))
+       print(f"Queued scheduled build for {due['branch']}; next run in {due['interval_seconds']} seconds",flush=True)
    with conn() as c:
     job=c.execute("SELECT * FROM builds WHERE status='queued' AND cancel_requested=0 ORDER BY id LIMIT 1").fetchone()
    if job: build(dict(job))
