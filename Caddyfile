@@ -1,0 +1,9 @@
+:80 {
+    root * /srv/artifacts
+    file_server browse
+
+    # Enable range requests and mime types for UKIs, CAIBX, and EROFS images
+    header {
+        Access-Control-Allow-Origin *
+    }
+}
