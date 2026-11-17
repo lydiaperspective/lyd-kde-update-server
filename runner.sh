@@ -248,6 +248,58 @@ else
 fi
 
 # --------------------------------------------------
+# Build script override
+# --------------------------------------------------
+
+restore_build_script() {
+    local backup="$WORKDIR/.build.sh.upstream-backup"
+
+    if [ -f "$backup" ]; then
+        echo "==> Restoring upstream build.sh..."
+        mv -f "$backup" "$WORKDIR/build.sh"
+    fi
+}
+
+run_build() {
+    echo "==> Applying build-server build.sh override..."
+
+    local backup="$WORKDIR/.build.sh.upstream-backup"
+
+    # Restore any leftover backup from an interrupted previous run.
+    restore_build_script
+
+    # Save the version belonging to the currently merged Git commit.
+    if ! git show HEAD:build.sh > "$backup"; then
+        echo "ERROR: Could not back up upstream build.sh."
+        rm -f "$backup"
+        return 1
+    fi
+
+    # Replace the repository version with our build-server version.
+    if ! cp /usr/local/bin/kde-linux-build.sh "$WORKDIR/build.sh"; then
+        echo "ERROR: Could not install build-server build.sh."
+        restore_build_script
+        return 1
+    fi
+
+    chmod +x "$WORKDIR/build.sh"
+
+    local status=0
+
+    echo "==> Running overridden build.sh..."
+
+    ./build.sh || status=$?
+
+    # Restore the original file regardless of build success.
+    restore_build_script
+
+    return "$status"
+}
+
+# Restore the original file if the runner exits unexpectedly.
+trap restore_build_script EXIT
+
+# --------------------------------------------------
 # Artifact publishing
 # --------------------------------------------------
 
@@ -549,7 +601,7 @@ while true; do
 
     echo "==> New commits detected. Starting build..."
 
-    if ./build.sh; then
+    if run_build; then
         echo "==> Build completed successfully!"
 
         if publish_artifacts; then
